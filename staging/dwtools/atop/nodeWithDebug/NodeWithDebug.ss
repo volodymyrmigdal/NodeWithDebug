@@ -3,13 +3,16 @@
 if( typeof module !== "undefined" )
 {
   require( 'wTools' );
-  require( 'wPath' );
+  require( 'wPathFundamentals' );
   require( 'wConsequence' );
   require( 'wFiles' );
 
   // var Chrome = require( './browser/Chrome.ss' );
   var Electron = require( './browser/electron/Electron.ss' );
-  var portscanner = require( 'portscanner' );
+  var Node = require( './node/Node.ss' );
+  var ipc = require( 'node-ipc' );
+  var CDP = require('chrome-remote-interface');
+  var ipcMainId = 'debugnode';
 
   var _ = wTools;
 }
@@ -19,72 +22,18 @@ if( typeof module !== "undefined" )
 var shell;
 var debuggerPort;
 var nodeVersion;
-
-//
-
-function getFreePort()
-{
-  var result = new wConsequence();
-
-  portscanner.findAPortNotInUse( 1024, 65535, ( err, port ) =>
-  {
-    debuggerPort = port;
-    result.give( err || undefined, port || undefined ); 
-  });
-
-  return result;
-}
-
-//
-
-function launchDebugger( port )
-{
-  var e = /^v(\d+).(\d+).(\d+)/.exec( process.version );
-
-  if( !e )
-  throw _.err( 'Cant parse node version', process.version );
-
-  nodeVersion =
-  {
-    major : Number.parseFloat( e[ 1 ] ),
-    minor : Number.parseFloat( e[ 2 ] )
-  }
-
-  if( nodeVersion.major < 6 || nodeVersion.major === 6 && nodeVersion.minor < 3 )
-  throw _.err( 'Incompatible node version: ', process.version, ', use 6.3.0 or higher!' );
-
-  var flags = [];
-
-  if( nodeVersion.major < 8 )
-  flags.push( '--inspect=' + port,'--debug-brk' )
-  else
-  flags.push( '--inspect-brk=' + port )
-
-  flags.push.apply( flags, process.argv.slice( 2 ) );
-
-  var shellOptions =
-  {
-    mode : 'spawn',
-    path : 'node',
-    args : flags,
-    stdio : 'inherit',
-    outputPiping : 0
-  }
-
-  shell = _.shell( shellOptions );
-
-  // shellOptions.process.stdout.pipe( process.stdout );
-  // shellOptions.process.stderr.pipe( process.stderr );
-
-  process.on( 'SIGINT', () => shellOptions.process.kill( 'SIGINT' ) );
-}
-
-//
+var electron;
 
 function debuggerInfoGet( port )
 {
   var request = require( 'request' );
-  var requestUrl = 'http://localhost:' + port + '/json/list';
+  var requestUrl = _.uri.str
+  ({
+    protocol : 'http',
+    host : '127.0.0.1',
+    port : port,
+    localPath : 'json/list'
+  });
 
   var result = new wConsequence();
 
@@ -110,38 +59,19 @@ function launch()
   }
 
   var scriptPath = process.argv[ 2 ];
-  scriptPath = _.pathJoin( _.pathCurrent(), scriptPath );
+  scriptPath = _.path.join( _.path.current(), scriptPath );
 
   if( !_.fileProvider.fileStat( scriptPath ) )
   throw _.err( 'Provided file path does not exist! ', process.argv[ 2 ] );
 
-  return getFreePort()
-  .ifNoErrorThen( () => launchDebugger( debuggerPort ) )
-  .ifNoErrorThen( () => debuggerInfoGet( debuggerPort ) )
-  .ifNoErrorThen( ( info ) =>
+  _prepareLaunch()
+  .ifNoErrorThen( ( preloadScriptPath ) =>
   {
-    // var chrome = new Chrome();
-    // var browser = chrome.launchChrome();
-    // var onUrlLoaded = browser.gotoUrl( info.devtoolsFrontendUrl );
-
-    // if( nodeVersion.major >= 8 )
-    // {
-    //   onUrlLoaded
-    //   .doThen( () => browser.waitForPause() )
-    //   .doThen( () => browser.unPause() );
-    // }
-
-    var electron = new Electron();
-    var browser = electron.launchElectron( info.devtoolsFrontendUrl );
-
-    process.on( 'SIGINT', () => browser.process.kill() );
-
-    // shell.doThen( () =>  browser.close() );
-
-    shell.doThen( browser.launched );
-
-    return shell;
+    var mainNode = new Node({ preloadScriptPath : preloadScriptPath });
+    mainNode.launchNode();
   })
+
+
 
   // var debugUrlFinded = false;
   // var onDebugReady = new wConsequence();
@@ -176,6 +106,102 @@ function launch()
   //     }
   //   }
   // })
+}
+
+//
+
+function _launchElectron()
+{
+  _.assert( !electron );
+
+  electron = new Electron();
+  var browser = electron.launchElectron();
+
+  process.on( 'SIGINT', () => browser.process.kill() );
+
+  // shell.doThen( () =>  browser.close() );
+
+  // shell.doThen( browser.launched );
+}
+
+//
+
+function _prepareLaunch()
+{
+  let prepareReady = new _.Consequence();
+
+  ipc.config.id = ipcMainId;
+  ipc.config.retry= 1500;
+  ipc.config.silent = 1;
+
+  ipc.serve( ipcServeHandler );
+  ipc.server.start();
+
+  let chokidar = require('chokidar');
+  let watchDir = _.fileProvider.path.nativize( _.path.join( __dirname, 'node/tmp', '' + process.pid ) );
+  let preloadFilePathSrc = _.path.join( __dirname, 'node/Preload.ss' );
+  let preloadFilePathDst = _.path.join( watchDir, 'Preload.ss' );
+
+  _.fileProvider.fileCopy( preloadFilePathDst, preloadFilePathSrc );
+
+  process.on( 'exit', () => _.fileProvider.filesDelete( watchDir ) );
+
+  let watcher;
+  let nodes = {};
+
+  process.on( 'SIGINT', () =>
+  {
+    if( watcher )
+    watcher.close();
+    ipc.server.stop()
+  });
+
+  _launchElectron();
+
+  let electronSocket;
+
+  ipc.server.on( 'socket.disconnected', ( socket ) =>
+  {
+    electronSocket = null;
+    _.fileProvider.fileWrite( preloadFilePathDst, '' );
+    watcher.close();
+    ipc.server.stop();
+  })
+
+  ipc.server.on( 'electronReady', ( data, socket ) =>
+  {
+    electronSocket = socket;
+
+    watcher = chokidar.watch( watchDir,  { ignoreInitial : true, ignored: /(^|[\/\\])\../}).on( 'all', (event, path) =>
+    {
+
+      if( event === 'add' )
+      {
+        var file = _.fileProvider.fileReadJson( path );
+        debuggerInfoGet( file.debugPort )
+        .ifNoErrorThen( ( info ) =>
+        {
+          let url = info.devtoolsFrontendUrl || info.devtoolsFrontendUrlCompat;
+          nodes[ url ] = info;
+
+          if( !electronSocket )
+          return
+
+          ipc.server.emit( electronSocket, 'electron.loadURL', { id : ipc.config.id, url : url } )
+
+        })
+      }
+    });
+  });
+
+  //
+
+  function ipcServeHandler()
+  {
+    prepareReady.give( preloadFilePathDst );
+  }
+
+  return prepareReady;
 }
 
 //

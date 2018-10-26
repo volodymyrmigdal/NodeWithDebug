@@ -42,13 +42,13 @@ function launchElectron( url )
 
   var appPath = require( 'electron' );
 
-  var launcherPath  = _.pathResolve( __dirname, './ElectronProcess.ss' );
-  launcherPath  = _.fileProvider.pathNativize( launcherPath );
+  var launcherPath  = _.path.resolve( __dirname, './ElectronProcess.ss' );
+  launcherPath  = _.fileProvider.path.nativize( launcherPath );
 
   var flags =
   [
     launcherPath,
-    url
+    // url
   ];
 
   var o =
@@ -112,7 +112,7 @@ var Proto =
 
 //
 
-_.classMake
+_.classDeclare
 ({
   cls : Self,
   parent : Parent,

@@ -1,8 +1,12 @@
+require('wFiles');
+
+var _ = _global_.wTools;
+
+_.include( 'wExternalFundamentals' )
 
 debugger
-console.log( process.argv )
-
-/*
-  How to run :
-  debugnode sample/Sample.js abc
-*/
+_.shell({ mode : 'spawn', path : 'node sample/Sample.1.js', stdio : 'inherit' })
+.doThen( () =>
+{
+    debugger
+} )
